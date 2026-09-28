@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChessMind</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 260px;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 13px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid #313244;
+    }
+    .logo {
+      font-size: 22px;
+    }
+    .title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #89b4fa;
+    }
+    .subtitle {
+      font-size: 11px;
+      color: #6c7086;
+    }
+
+    .section {
+      padding: 14px 16px;
+      border-bottom: 1px solid #313244;
+    }
+    .section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: #6c7086;
+      margin-bottom: 10px;
+    }
+
+    /* Toggle switch */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .toggle-label { font-weight: 600; color: #cdd6f4; }
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 40px;
+      height: 22px;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: #313244;
+      border-radius: 22px;
+      transition: .25s;
+    }
+    .slider:before {
+      content: '';
+      position: absolute;
+      height: 16px; width: 16px;
+      left: 3px; bottom: 3px;
+      background: #6c7086;
+      border-radius: 50%;
+      transition: .25s;
+    }
+    input:checked + .slider { background: #89b4fa; }
+    input:checked + .slider:before { transform: translateX(18px); background: #1e1e2e; }
+
+    /* Status badge */
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      margin-top: 8px;
+      color: #6c7086;
+    }
+    .status-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: #45475a;
+    }
+    .status-dot.active { background: #a6e3a1; box-shadow: 0 0 6px #a6e3a1; }
+    .status-dot.waiting { background: #fab387; }
+
+    /* Move display */
+    .move-display {
+      text-align: center;
+      padding: 10px 0 4px;
+    }
+    .move-big {
+      font-size: 36px;
+      font-weight: 800;
+      color: #a6e3a1;
+      letter-spacing: .04em;
+      min-height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .move-big.thinking {
+      color: #585b70;
+      animation: pulse 1s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+    .move-sub {
+      font-size: 11px;
+      color: #6c7086;
+      margin-top: 2px;
+    }
+
+    /* Humanization slider */
+    .range-row {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .range-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .range-val {
+      font-size: 12px;
+      font-weight: 700;
+      color: #89b4fa;
+    }
+    input[type=range] {
+      width: 100%;
+      accent-color: #89b4fa;
+      cursor: pointer;
+    }
+    .range-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: #45475a;
+    }
+
+    /* Depth selector */
+    .depth-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 10px;
+    }
+    .depth-label { color: #a6adc8; }
+    select {
+      background: #313244;
+      color: #cdd6f4;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    /* Footer */
+    .footer {
+      padding: 10px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .footer-note { font-size: 10px; color: #45475a; }
+    .refresh-btn {
+      background: #313244;
+      color: #89b4fa;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .refresh-btn:hover { background: #45475a; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="logo">♟</span>
+    <div>
+      <div class="title">ChessMind</div>
+      <div class="subtitle">Humanized Move Advisor</div>
+    </div>
+  </div>
+
+  <!-- Enable / Status -->
+  <div class="section">
+    <div class="toggle-row">
+      <span class="toggle-label">Advisor active</span>
+      <label class="switch">
+        <input type="checkbox" id="enabledToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="toggle-row" style="margin-top: 12px;">
+      <span class="toggle-label" style="font-weight: 500; font-size: 12px; color: #a6adc8;">Highlight on board</span>
+      <label class="switch" style="width: 34px; height: 18px;">
+        <input type="checkbox" id="highlightToggle" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="status-badge" style="margin-top: 10px;">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">Disabled</span>
+    </div>
+  </div>
+
+  <!-- Move display -->
+  <div class="section">
+    <div class="section-title">Suggested Move</div>
+    <div class="move-display">
+      <div class="move-big" id="moveDisplay">—</div>
+      <div class="move-sub" id="moveSub">Enable the advisor to start</div>
+    </div>
+  </div>
+
+  <!-- Humanization -->
+  <div class="section">
+    <div class="section-title">Humanization</div>
+    <div class="range-row">
+      <div class="range-header">
+        <span style="color:#a6adc8">Deviation from best</span>
+        <span class="range-val" id="humanizeLabel">Human-like</span>
+      </div>
+      <input type="range" id="humanizeSlider" min="0" max="4" step="1" value="2">
+      <div class="range-labels">
+        <span>Engine</span>
+        <span>Expert ~2300</span>
+        <span>Casual</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Depth -->
+  <div class="section">
+    <div class="section-title">Engine Settings</div>
+    <div class="depth-row">
+      <span class="depth-label">Analysis depth</span>
+      <select id="depthSelect">
+        <option value="10">10 (Fast)</option>
+        <option value="12">12</option>
+        <option value="15" selected>15 (Balanced)</option>
+        <option value="18">18 (Strong)</option>
+        <option value="20">20 (Max)</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <span class="footer-note">chess.com only</span>
+    <button class="refresh-btn" id="refreshBtn">⟳ Refresh</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
