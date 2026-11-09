@@ -16,7 +16,7 @@
         "https://www.chess.com/play/*",
         "https://www.chess.com/chess/*"
       ],
-      "js": ["content.js"],
+      "js": ["autoplay.js", "advantage.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

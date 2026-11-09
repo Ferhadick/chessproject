@@ -8,7 +8,7 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      width: 260px;
+      width: 300px;
       background: #1e1e2e;
       color: #cdd6f4;
       font-family: 'Segoe UI', system-ui, sans-serif;
@@ -40,6 +40,7 @@
       border-bottom: 1px solid #313244;
     }
     .section-title {
+      display: block;
       font-size: 11px;
       text-transform: uppercase;
       letter-spacing: .06em;
@@ -61,6 +62,7 @@
       height: 22px;
     }
     .switch input { opacity: 0; width: 0; height: 0; }
+    .switch:focus-within { outline: 2px solid #89b4fa; outline-offset: 3px; border-radius: 22px; }
     .slider {
       position: absolute;
       cursor: pointer;
@@ -124,33 +126,8 @@
       margin-top: 2px;
     }
 
-    /* Humanization slider */
-    .range-row {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .range-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .range-val {
-      font-size: 12px;
-      font-weight: 700;
-      color: #89b4fa;
-    }
-    input[type=range] {
-      width: 100%;
-      accent-color: #89b4fa;
-      cursor: pointer;
-    }
-    .range-labels {
-      display: flex;
-      justify-content: space-between;
-      font-size: 10px;
-      color: #45475a;
-    }
+    .profile-select { width: 100%; padding: 7px 8px; }
+    .profile-help { font-size: 11px; color: #a6adc8; line-height: 1.4; margin-top: 7px; }
 
     /* Depth selector */
     .depth-row {
@@ -160,7 +137,7 @@
       margin-top: 10px;
     }
     .depth-label { color: #a6adc8; }
-    select {
+    select, input[type=number] {
       background: #313244;
       color: #cdd6f4;
       border: 1px solid #45475a;
@@ -189,6 +166,12 @@
       transition: background .15s;
     }
     .refresh-btn:hover { background: #45475a; }
+    .refresh-btn:focus-visible, select:focus-visible, input[type=number]:focus-visible {
+      outline: 2px solid #89b4fa;
+      outline-offset: 2px;
+    }
+    .footer-actions { display: flex; gap: 6px; }
+    .refresh-btn:disabled { opacity: .5; cursor: default; }
   </style>
 </head>
 <body>
@@ -205,21 +188,54 @@
     <div class="toggle-row">
       <span class="toggle-label">Advisor active</span>
       <label class="switch">
-        <input type="checkbox" id="enabledToggle">
+        <input type="checkbox" id="enabledToggle" aria-label="Advisor active">
         <span class="slider"></span>
       </label>
     </div>
     <div class="toggle-row" style="margin-top: 12px;">
       <span class="toggle-label" style="font-weight: 500; font-size: 12px; color: #a6adc8;">Highlight on board</span>
       <label class="switch" style="width: 34px; height: 18px;">
-        <input type="checkbox" id="highlightToggle" checked>
+        <input type="checkbox" id="highlightToggle" checked aria-label="Highlight suggested move on board">
         <span class="slider"></span>
       </label>
     </div>
-    <div class="status-badge" style="margin-top: 10px;">
+    <div class="status-badge" style="margin-top: 10px;" role="status" aria-live="polite">
       <span class="status-dot" id="statusDot"></span>
       <span id="statusText">Disabled</span>
     </div>
+  </div>
+
+  <div class="section">
+    <div class="toggle-row">
+      <label class="toggle-label" for="autoPlayToggle">Auto-play</label>
+      <label class="switch">
+        <input type="checkbox" id="autoPlayToggle" disabled aria-label="Automatically play suggested moves">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <p class="profile-help" id="autoPlayStatus" role="status">Enable the advisor on a chess board. Esc or a manual board click stops auto-play.</p>
+    <div class="toggle-row" style="margin-top:12px">
+      <label for="adaptiveDelayToggle">Position-aware pauses</label>
+      <label class="switch"><input id="adaptiveDelayToggle" type="checkbox" checked aria-label="Adjust pauses to position difficulty"><span class="slider"></span></label>
+    </div>
+    <p class="profile-help">Clear choices use shorter pauses; close alternatives, promotions and pawn endings use longer pauses, within your selected range.</p>
+    <div class="toggle-row" style="margin-top:12px">
+      <label for="premoveToggle">Conditional premoves</label>
+      <label class="switch"><input id="premoveToggle" type="checkbox" aria-label="Prepare conditional recaptures"><span class="slider"></span></label>
+    </div>
+    <p class="profile-help">Prepare an engine recapture during the opponent's turn. Play it without an added pause only if the exact predicted position appears. Not a move queued on the site. Prepared replies use the best engine continuation.</p>
+    <button class="refresh-btn" id="exportResearchBtn" style="margin-top:8px">Export research logs</button>
+  </div>
+
+  <div class="section">
+    <div class="toggle-row">
+      <label class="toggle-label" for="advantageToggle">Player advantage bars</label>
+      <label class="switch">
+        <input type="checkbox" id="advantageToggle" checked aria-label="Show advantage bars near player names">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <p class="profile-help">Engine score in pawns, from each player's perspective. This is not a win probability.</p>
   </div>
 
   <!-- Move display -->
@@ -227,25 +243,42 @@
     <div class="section-title">Suggested Move</div>
     <div class="move-display">
       <div class="move-big" id="moveDisplay">—</div>
-      <div class="move-sub" id="moveSub">Enable the advisor to start</div>
+      <div class="move-sub" id="moveSub" aria-live="polite">Enable the advisor to start</div>
     </div>
   </div>
 
-  <!-- Humanization -->
   <div class="section">
-    <div class="section-title">Humanization</div>
-    <div class="range-row">
-      <div class="range-header">
-        <span style="color:#a6adc8">Deviation from best</span>
-        <span class="range-val" id="humanizeLabel">Human-like</span>
-      </div>
-      <input type="range" id="humanizeSlider" min="0" max="4" step="1" value="2">
-      <div class="range-labels">
-        <span>Engine</span>
-        <span>Expert ~2300</span>
-        <span>Casual</span>
-      </div>
+    <label class="section-title" for="presetSelect">Time control preset</label>
+    <select id="presetSelect" class="profile-select">
+      <option value="custom">Custom</option>
+      <option value="bullet">Bullet — fastest response</option>
+      <option value="blitz">Blitz — balanced</option>
+      <option value="rapid">Rapid — deeper search</option>
+    </select>
+    <p class="profile-help" id="presetHelp">Adjust settings individually.</p>
+  </div>
+
+  <!-- Move style -->
+  <div class="section">
+    <label class="section-title" for="profileSelect">Engine level</label>
+    <select id="profileSelect" class="profile-select">
+      <option value="0">Pure engine — uncapped</option>
+      <option value="4">Expert — ~2300 Elo</option>
+      <option value="1">Subtle — ~1500 Elo</option>
+      <option value="2" selected>Human-like — ~1200 Elo</option>
+      <option value="3">Casual — ~900 Elo</option>
+    </select>
+    <p class="profile-help">Elo values are rough profile estimates, not calibrated ratings. Actual strength varies with position and search time. Engine level is independent of your time preset.</p>
+  </div>
+
+  <div class="section">
+    <div class="toggle-row">
+      <label for="qualityToggle" class="toggle-label">Move-quality target</label>
+      <label class="switch"><input id="qualityToggle" type="checkbox" aria-label="Use estimated move-quality target"><span class="slider"></span></label>
     </div>
+    <div class="depth-row"><label for="qualityMin">Minimum (0–100)</label><input id="qualityMin" type="number" min="0" max="100" step="1" value="75" style="width:76px"></div>
+    <div class="depth-row"><label for="qualityMax">Maximum (0–100)</label><input id="qualityMax" type="number" min="0" max="100" step="1" value="89" style="width:76px"></div>
+    <p class="profile-help" id="qualityHelp" role="status">Internal estimate, not Chess.com accuracy. Overrides engine level while on. Depth and time limits stay unchanged. Forced moves and advantage protection may exceed the range; wins are not guaranteed.</p>
   </div>
 
   <!-- Depth -->
@@ -261,14 +294,41 @@
         <option value="20">20 (Max)</option>
       </select>
     </div>
+    <div class="depth-row">
+      <label class="depth-label" for="timeBudgetSelect">Search time limit</label>
+      <select id="timeBudgetSelect">
+        <option value="0">Depth only</option>
+        <option value="250">0.25 seconds</option>
+        <option value="1000">1 second</option>
+        <option value="3000">3 seconds</option>
+      </select>
+    </div>
+    <p class="profile-help">Search stops at the depth or time limit, whichever comes first. Startup time is additional.</p>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Auto-play move delay</div>
+    <div class="depth-row">
+      <label for="moveDelayMin">Minimum (seconds)</label>
+      <input id="moveDelayMin" type="number" min="0" max="30" step="0.05" style="width:76px">
+    </div>
+    <div class="depth-row">
+      <label for="moveDelayMax">Maximum (seconds)</label>
+      <input id="moveDelayMax" type="number" min="0" max="30" step="0.05" style="width:76px">
+    </div>
+    <p class="profile-help" id="moveDelayHelp" role="status">A position-aware random pause within this range is added after analysis. Set both to 0 for no pause.</p>
   </div>
 
   <!-- Footer -->
   <div class="footer">
     <span class="footer-note">chess.com only</span>
-    <button class="refresh-btn" id="refreshBtn">⟳ Refresh</button>
+    <div class="footer-actions">
+      <button class="refresh-btn" id="showPanelBtn" title="Reopen the panel on the board">Show panel</button>
+      <button class="refresh-btn" id="refreshBtn" title="Analyze the current position again">⟳ Refresh</button>
+    </div>
   </div>
 
+  <script src="autoplay.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

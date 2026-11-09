@@ -11,11 +11,170 @@
   let manualPlayerColor = 'auto'; // 'auto' | 'white' | 'black'
   let isEnabled = false;
   let analysisDepth = 15;
+  let timeBudgetMs = 0;
+  let analysisDelayMs = 350;
+  let moveDelayMinMs = 0;
+  let moveDelayMaxMs = 0;
   let humanizationLevel = 2; // 0=none, 1=low, 2=medium, 3=high
   let showBoardHighlights = true;
+  let showAdvantageBars = true;
+  let adaptiveDelay = true;
+  let premovesEnabled = false;
+  const replyCache = ChessMindAutoPlay.createPredictionCache();
+  let qualityTarget = { enabled: false, min: 75, max: 89 };
+  const advantageBars = ChessMindAdvantage.create(document, window, getBoardElement, isBoardFlipped);
   let lastComputedMove = null;
   let boardObserver = null;
+  let watchedBoard = null;
+  let boardCheckTimer = null;
   let analysisTimer = null;
+  let analysisGeneration = 0;
+  let lastGrid = null;
+  let lastPlacement = null;
+  let castlingRights = '-';
+  let enPassantSquare = '-';
+  let lastBoardElement = null;
+  let lastMoveCount = 0;
+  let lastPieceSignature = null;
+  let positionIssue = 'Waiting for board…';
+  const START_PLACEMENT = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR';
+  const MOVE_SELECTOR = '.move-list-row .node, .game-node-node, [data-whole-move-number] .node';
+
+  let contextRetired = false;
+  const RELOAD_MESSAGE = 'Extension updated — refresh this page';
+  function contextError(error) {
+    return contextRetired || /extension context invalidated/i.test(error?.message || String(error));
+  }
+  function retireContext() {
+    if (contextRetired) return;
+    contextRetired = true;
+    isEnabled = false;
+    invalidateAnalysis();
+    clearInterval(boardCheckTimer);
+    boardCheckTimer = null;
+    clearTimeout(analysisTimer);
+    boardObserver?.disconnect();
+    boardObserver = null;
+    clearHighlights();
+    advantageBars.hide();
+    autoPlayer.stop(RELOAD_MESSAGE);
+    if (overlayEl) {
+      overlayEl.querySelectorAll('input, select').forEach(control => {
+        control.disabled = true;
+        if (control.type === 'checkbox') control.checked = false;
+      });
+    }
+    const wrap = document.getElementById('cm-move-wrap');
+    if (wrap) wrap.style.display = 'none';
+    setStatus(RELOAD_MESSAGE);
+  }
+  function extensionAvailable() {
+    if (contextRetired) return false;
+    try { if (chrome.runtime?.id) return true; } catch { /* Context was unloaded. */ }
+    retireContext();
+    return false;
+  }
+  async function extensionOperation(operation) {
+    if (!extensionAvailable()) throw new Error(RELOAD_MESSAGE);
+    try { return await operation(); }
+    catch (error) {
+      if (contextError(error)) retireContext();
+      throw error;
+    }
+  }
+  function notify(message) {
+    // Missing receivers are normal when the popup is closed. The wrapper also
+    // catches synchronous throws, which .sendMessage(...).catch() cannot catch.
+    extensionOperation(() => chrome.runtime.sendMessage(message)).catch(() => {});
+  }
+  function saveSettings(settings) {
+    extensionOperation(() => chrome.storage.local.set(settings)).catch(error => {
+      if (!contextError(error)) console.error('[ChessMind] Could not save settings:', error);
+    });
+  }
+
+  let researchLog = null;
+  let logKey = null;
+  let logQueue = Promise.resolve();
+  function autoSettings() {
+    return { depth: analysisDepth, timeBudgetMs, humanizationLevel, analysisDelayMs, moveDelayMinMs, moveDelayMaxMs, qualityTarget: { ...qualityTarget }, adaptiveDelay, premovesEnabled };
+  }
+  function gameOutcome() {
+    const result = document.querySelector('.game-over-modal-content, .game-over-header-component, .game-over-message-component');
+    return result && result.getBoundingClientRect().width > 0 ? result.textContent.trim().slice(0, 500) : null;
+  }
+  const autoPlayer = ChessMindAutoPlay.create({
+    read: () => ({
+      url: location.href, board: getBoardElement(), fen: buildFenFromDOM(),
+      enabled: isEnabled, hidden: document.hidden, outcome: gameOutcome(),
+      player: detectPlayerColor() === 'white' ? 'w' : 'b', settings: autoSettings()
+    }),
+    click: clickAutoSquare,
+    promote: async (color, piece) => {
+      const code = `${color}${piece}`;
+      const choice = document.querySelector(`.promotion-window .piece.${code}, .promotion-piece.${code}, .promotion-window [data-piece="${code}"]`);
+      if (!choice || choice.getBoundingClientRect().width === 0) return false;
+      choice.click();
+      return true;
+    },
+    record: event => {
+      if (event.type === 'start') {
+        logKey = `researchRun:${crypto.randomUUID()}`;
+        researchLog = { version: 1, events: [] };
+      }
+      researchLog.events.push(event);
+      const key = logKey;
+      const snapshot = JSON.parse(JSON.stringify(researchLog));
+      logQueue = logQueue.catch(() => {}).then(() => extensionOperation(() => chrome.storage.local.set({ [key]: snapshot })));
+      return logQueue;
+    },
+    onLogError: error => { if (!contextError(error)) console.error('[ChessMind] Could not save research log:', error); },
+    onState: (state, reason) => {
+      if (!state.active) replyCache.clear();
+      const toggle = document.getElementById('cm-autoplay');
+      if (toggle) toggle.checked = state.active;
+      publishStatus(reason, state.active ? 'active' : '');
+      notify({ type: 'AUTOPLAY_STATE', ...state, reason });
+    },
+    onReady: () => { invalidateAnalysis(); analyzePosition(); }
+  });
+
+  async function clickAutoSquare(square) {
+    if (!extensionAvailable()) throw new Error(RELOAD_MESSAGE);
+    const board = getBoardElement();
+    if (!board || document.hidden) throw new Error('Board is unavailable');
+    const rect = board.getBoundingClientRect();
+    const coords = getSquareCoords(square, isBoardFlipped(board));
+    if (!coords || rect.width === 0 || rect.height === 0) throw new Error('Board is not visible');
+    const clientX = rect.left + rect.width * coords.centerX / 100;
+    const clientY = rect.top + rect.height * coords.centerY / 100;
+    const target = document.elementFromPoint(clientX, clientY);
+    if (!target || !board.contains(target)) throw new Error('Board is covered — move the panel and try again');
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      const options = { bubbles: true, composed: true, cancelable: true, clientX, clientY,
+        button: 0, buttons: type.endsWith('down') ? 1 : 0, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+      target.dispatchEvent(type.startsWith('pointer') ? new PointerEvent(type, options) : new MouseEvent(type, options));
+    }
+  }
+
+  async function toggleAutoPlay(value) {
+    if (!value) { autoPlayer.stop(); return; }
+    if (!extensionAvailable()) throw new Error(RELOAD_MESSAGE);
+    await autoPlayer.start();
+    invalidateAnalysis();
+    analyzePosition();
+  }
+
+  function invalidateAnalysis() {
+    analysisGeneration++;
+    currentFen = null;
+    lastComputedMove = null;
+  }
+
+  function publishStatus(text, dotClass = 'waiting') {
+    setStatus(contextRetired ? RELOAD_MESSAGE : text);
+    if (!contextRetired) notify({ type: 'STATUS_UPDATE', text, dotClass });
+  }
 
   // ─── Chess.com board reading ───────────────────────────────────────────────
 
@@ -26,6 +185,25 @@
       document.querySelector('.board') ||
       document.querySelector('#board')
     );
+  }
+
+  function isBoardFlipped(board) {
+    return Boolean(board?.classList.contains('flipped') || board?.closest?.('.flipped') ||
+      document.querySelector('.flipped chess-board, .flipped wc-chess-board, #board-layout-chessboard.flipped, .board-layout-main.flipped, .board-layout-chessboard.flipped'));
+  }
+
+  function pieceSignature(board) {
+    const entries = [];
+    board.querySelectorAll('.piece').forEach(el => {
+      let square = '';
+      let piece = '';
+      el.classList.forEach(cls => {
+        if (cls.startsWith('square-')) square = cls;
+        if (/^[wb][pnbrqk]$/.test(cls)) piece = cls;
+      });
+      if (square && piece) entries.push(`${square}:${piece}`);
+    });
+    return entries.sort().join('|');
   }
 
   /**
@@ -44,12 +222,7 @@
     const board = getBoardElement();
 
     // 1. Direct class check on board or common container elements
-    if (board?.classList.contains('flipped')) return 'black';
-
-    const flippedParent = document.querySelector(
-      '.flipped chess-board, .flipped wc-chess-board, #board-layout-chessboard.flipped, .board-layout-main.flipped, .board-layout-chessboard.flipped, [class*="board"][class*="flipped"]'
-    );
-    if (flippedParent) return 'black';
+    if (isBoardFlipped(board)) return 'black';
 
     // 2. Coordinate check: in a flipped board, rank 1 is at the top
     const coordElements = document.querySelectorAll(
@@ -153,14 +326,30 @@
    */
   function buildFenFromDOM() {
     const board = getBoardElement();
-    if (!board) return null;
+    if (!board) {
+      positionIssue = 'Waiting for board…';
+      return null;
+    }
+    if (board !== lastBoardElement) {
+      lastBoardElement = board;
+      lastGrid = null;
+      lastPlacement = null;
+      castlingRights = '-';
+      enPassantSquare = '-';
+      lastMoveCount = 0;
+      lastPieceSignature = null;
+    }
 
     // 8x8 grid: ranks 8→1 (top→bottom), files a→h
     const grid = Array.from({ length: 8 }, () => Array(8).fill(null));
 
     const pieces = board.querySelectorAll('.piece');
-    if (pieces.length === 0) return null;
+    if (pieces.length === 0) {
+      positionIssue = 'Waiting for pieces…';
+      return null;
+    }
 
+    let parsedPieces = 0;
     pieces.forEach((el) => {
       let squareClass = null;
       let pieceCode = null;
@@ -176,8 +365,23 @@
       if (!parsed) return;
 
       // FEN row 0 = rank 8
+      parsedPieces++;
       grid[7 - parsed.rank][parsed.file] = pieceCode;
     });
+
+    const allPieces = grid.flat().filter(Boolean);
+    if (parsedPieces !== allPieces.length ||
+        allPieces.filter(p => p === 'wk').length !== 1 ||
+        allPieces.filter(p => p === 'bk').length !== 1 ||
+        allPieces.filter(p => p === 'wp').length > 8 ||
+        allPieces.filter(p => p === 'bp').length > 8 ||
+        allPieces.filter(p => p[0] === 'w').length > 16 ||
+        allPieces.filter(p => p[0] === 'b').length > 16 ||
+        grid[0].some(p => p?.[1] === 'p') ||
+        grid[7].some(p => p?.[1] === 'p')) {
+      positionIssue = 'Waiting for a complete position…';
+      return null;
+    }
 
     // Build FEN piece placement
     let fenRows = grid.map((row) => {
@@ -198,9 +402,49 @@
     });
 
     const piecePlacement = fenRows.join('/');
-    const turn = detectTurn();
+    const turn = detectTurn() || (piecePlacement === START_PLACEMENT ? 'w' : null);
+    if (!turn) {
+      positionIssue = 'Cannot determine whose turn it is';
+      return null;
+    }
+    updatePositionHistory(grid, piecePlacement);
+    lastPieceSignature = pieceSignature(board);
+    positionIssue = '';
+    return `${piecePlacement} ${turn} ${castlingRights} ${enPassantSquare} 0 1`;
+  }
 
-    return `${piecePlacement} ${turn} KQkq - 0 1`;
+  function updatePositionHistory(grid, placement) {
+    if (placement === lastPlacement) return;
+    const moveCount = document.querySelectorAll(MOVE_SELECTOR).length;
+    if (placement === START_PLACEMENT && (!lastGrid || (lastMoveCount > 0 && moveCount === 0))) {
+      castlingRights = 'KQkq';
+      enPassantSquare = '-';
+    } else if (lastGrid) {
+      const rights = new Set(castlingRights === '-' ? '' : castlingRights);
+      if (lastGrid[7][4] !== grid[7][4]) { rights.delete('K'); rights.delete('Q'); }
+      if (lastGrid[0][4] !== grid[0][4]) { rights.delete('k'); rights.delete('q'); }
+      if (lastGrid[7][7] !== grid[7][7]) rights.delete('K');
+      if (lastGrid[7][0] !== grid[7][0]) rights.delete('Q');
+      if (lastGrid[0][7] !== grid[0][7]) rights.delete('k');
+      if (lastGrid[0][0] !== grid[0][0]) rights.delete('q');
+      castlingRights = 'KQkq'.split('').filter(right => rights.has(right)).join('') || '-';
+
+      enPassantSquare = '-';
+      for (let file = 0; file < 8; file++) {
+        if (lastGrid[6][file] === 'wp' && grid[6][file] === null && grid[4][file] === 'wp') {
+          enPassantSquare = `${String.fromCharCode(97 + file)}3`;
+        } else if (lastGrid[1][file] === 'bp' && grid[1][file] === null && grid[3][file] === 'bp') {
+          enPassantSquare = `${String.fromCharCode(97 + file)}6`;
+        }
+      }
+    } else {
+      // A midgame board has no trustworthy history for castling or en passant.
+      castlingRights = '-';
+      enPassantSquare = '-';
+    }
+    lastGrid = grid;
+    lastPlacement = placement;
+    lastMoveCount = moveCount;
   }
 
   /**
@@ -237,9 +481,7 @@
     }
 
     // 2. Count move plies in the move list
-    const moveNodes = document.querySelectorAll(
-      '.move-list-row .node, .game-node-node, [data-whole-move-number] .node, .node:not(.icon-font-chess):not(.icon-font)'
-    );
+    const moveNodes = document.querySelectorAll(MOVE_SELECTOR);
     if (moveNodes.length > 0) {
       // 0 moves = White, 1 move = Black, 2 moves = White, etc.
       return moveNodes.length % 2 === 0 ? 'w' : 'b';
@@ -255,8 +497,7 @@
       if (isTop) return pColor === 'white' ? 'b' : 'w';
     }
 
-    // Opening position defaults to White
-    return 'w';
+    return null;
   }
 
   // ─── Overlay UI ───────────────────────────────────────────────────────────
@@ -270,7 +511,7 @@
       <div class="cm-header">
         <span class="cm-logo">♟ ChessMind</span>
         <button id="cm-color-badge" class="cm-color-badge" title="Playing as (Click to toggle: Auto / White / Black)">Auto ⚪</button>
-        <button class="cm-close" title="Close">✕</button>
+        <button class="cm-close" title="Hide panel (reopen from popup)" aria-label="Hide board panel">✕</button>
       </div>
       <div class="cm-body">
         <div class="cm-status" id="cm-status">Waiting for game…</div>
@@ -280,6 +521,9 @@
           <div class="cm-meta" id="cm-meta"></div>
         </div>
       </div>
+      <label class="cm-toggle" style="padding:8px 12px" title="Automatically play suggested moves on this board">
+        <input type="checkbox" id="cm-autoplay"> Auto-play <span style="margin-left:auto">Esc to stop</span>
+      </label>
       <div class="cm-footer">
         <label class="cm-toggle" title="Enable/disable advisor">
           <input type="checkbox" id="cm-enabled" ${isEnabled ? 'checked' : ''}>
@@ -289,11 +533,12 @@
           <input type="checkbox" id="cm-highlight" ${showBoardHighlights ? 'checked' : ''}>
           <span>Board</span>
         </label>
-        <select id="cm-humanize" title="Humanization level">
-          <option value="0" ${humanizationLevel===0?'selected':''}>Pure</option>
-          <option value="1" ${humanizationLevel===1?'selected':''}>Subtle</option>
-          <option value="2" ${humanizationLevel===2?'selected':''}>Human</option>
-          <option value="3" ${humanizationLevel===3?'selected':''}>Casual</option>
+        <select id="cm-humanize" ${qualityTarget.enabled ? 'disabled' : ''} title="Engine level (move-quality target overrides this when enabled)">
+          <option value="0" ${humanizationLevel===0?'selected':''}>Pure — uncapped</option>
+          <option value="4" ${humanizationLevel===4?'selected':''}>Expert — ~2300 Elo</option>
+          <option value="1" ${humanizationLevel===1?'selected':''}>Subtle — ~1500 Elo</option>
+          <option value="2" ${humanizationLevel===2?'selected':''}>Human — ~1200 Elo</option>
+          <option value="3" ${humanizationLevel===3?'selected':''}>Casual — ~900 Elo</option>
         </select>
       </div>
     `;
@@ -373,7 +618,7 @@
       #cm-humanize {
         background: #313244; color: #cdd6f4; border: 1px solid #45475a;
         border-radius: 6px; font-size: 11px; padding: 3px 5px;
-        cursor: pointer; max-width: 72px;
+        cursor: pointer; max-width: 130px;
       }
       .cm-thinking {
         display: inline-block;
@@ -386,6 +631,11 @@
     document.head.appendChild(style);
     document.body.appendChild(overlayEl);
 
+    document.getElementById('cm-autoplay').addEventListener('change', async e => {
+      try { await toggleAutoPlay(e.target.checked); }
+      catch (error) { e.target.checked = false; publishStatus(error.message, ''); }
+    });
+
     // Close button
     overlayEl.querySelector('.cm-close').addEventListener('click', () => {
       overlayEl.style.display = 'none';
@@ -394,7 +644,7 @@
     // Toggle active
     document.getElementById('cm-enabled').addEventListener('change', (e) => {
       isEnabled = e.target.checked;
-      chrome.storage.local.set({ enabled: isEnabled });
+      saveSettings({ enabled: isEnabled });
       if (isEnabled) startWatching();
       else stopWatching();
     });
@@ -402,7 +652,7 @@
     // Toggle board highlights
     document.getElementById('cm-highlight').addEventListener('change', (e) => {
       showBoardHighlights = e.target.checked;
-      chrome.storage.local.set({ showBoardHighlights });
+      saveSettings({ showBoardHighlights });
       if (!showBoardHighlights) {
         clearHighlights();
       } else if (lastComputedMove) {
@@ -419,7 +669,7 @@
       } else {
         manualPlayerColor = 'auto';
       }
-      chrome.storage.local.set({ manualPlayerColor });
+      saveSettings({ manualPlayerColor });
       updateOverlayPlayerColorBadge();
       currentFen = null;
       clearHighlights();
@@ -429,7 +679,9 @@
     // Humanization level
     document.getElementById('cm-humanize').addEventListener('change', (e) => {
       humanizationLevel = parseInt(e.target.value, 10);
-      chrome.storage.local.set({ humanizationLevel });
+      saveSettings({ humanizationLevel });
+      invalidateAnalysis();
+      analyzePosition();
     });
 
     // Dragging
@@ -533,6 +785,8 @@
   }
 
   window.addEventListener('resize', updateHighlightPosition, { passive: true });
+  window.addEventListener('resize', advantageBars.position, { passive: true });
+  window.addEventListener('scroll', advantageBars.position, { passive: true });
   window.addEventListener('scroll', updateHighlightPosition, { passive: true });
 
   function highlightMoveOnBoard(move) {
@@ -546,7 +800,7 @@
     const rect = board.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return;
 
-    const isFlipped = board.classList.contains('flipped');
+    const isFlipped = isBoardFlipped(board);
     const fromStr = move.slice(0, 2);
     const toStr = move.slice(2, 4);
 
@@ -684,14 +938,29 @@
   // ─── Board watching ────────────────────────────────────────────────────────
 
   function startWatching() {
+    if (!isEnabled) return;
+    if (!boardCheckTimer) {
+      boardCheckTimer = setInterval(() => {
+        if (!extensionAvailable()) return;
+        autoPlayer.monitor();
+        advantageBars.position();
+        if (getBoardElement() !== watchedBoard) startWatching();
+      }, 1500);
+    }
     const board = getBoardElement();
     if (!board) {
-      setStatus('Waiting for board…');
-      setTimeout(startWatching, 1000);
+      boardObserver?.disconnect();
+      boardObserver = null;
+      watchedBoard = null;
+      invalidateAnalysis();
+      clearHighlights();
+      advantageBars.hide();
+      publishStatus('Waiting for board…');
       return;
     }
 
-    setStatus('Watching board…');
+    watchedBoard = board;
+    publishStatus('Watching board…', 'active');
     playerColor = detectPlayerColor();
 
     if (boardObserver) {
@@ -699,9 +968,17 @@
     }
 
     boardObserver = new MutationObserver(() => {
-      clearHighlights();
+      if (!extensionAvailable()) return;
+      const signature = pieceSignature(board);
+      if (signature !== lastPieceSignature) {
+        invalidateAnalysis();
+        lastPieceSignature = signature;
+        clearHighlights();
+        if (showAdvantageBars) advantageBars.show(null);
+        publishStatus('Board changed…');
+      }
       clearTimeout(analysisTimer);
-      analysisTimer = setTimeout(analyzePosition, 350);
+      analysisTimer = setTimeout(analyzePosition, analysisDelayMs);
     });
 
     boardObserver.observe(board, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
@@ -710,75 +987,140 @@
   }
 
   function stopWatching() {
+    autoPlayer.stop('Advisor paused');
+    advantageBars.hide();
+    invalidateAnalysis();
+    clearInterval(boardCheckTimer);
+    boardCheckTimer = null;
+    watchedBoard = null;
     clearHighlights();
     if (boardObserver) {
       boardObserver.disconnect();
       boardObserver = null;
     }
     clearTimeout(analysisTimer);
-    setStatus('Paused');
+    publishStatus('Paused', '');
     const wrap = document.getElementById('cm-move-wrap');
     if (wrap) wrap.style.display = 'none';
   }
 
   function analyzePosition() {
-    if (!isEnabled) return;
+    if (!isEnabled || document.hidden || !extensionAvailable()) return;
 
     const fen = buildFenFromDOM();
     if (!fen) {
-      setStatus('Waiting for board…');
+      invalidateAnalysis();
+      clearHighlights();
+      advantageBars.hide();
+      publishStatus(positionIssue);
       return;
     }
 
     if (fen === currentFen) return;
+    analysisGeneration++;
+    lastComputedMove = null;
+    clearHighlights();
     currentFen = fen;
 
     const turn = fen.split(' ')[1]; // 'w' or 'b'
     playerColor = detectPlayerColor();
     updateOverlayPlayerColorBadge();
 
-    // Check if it's the player's turn
+    // Evaluate both turns; only show or execute advice on the player's turn.
     const playerTurn = playerColor === 'white' ? 'w' : 'b';
-    if (turn !== playerTurn) {
+    const isPlayerTurn = turn === playerTurn;
+    const automatic = autoPlayer.state().active;
+    if (isPlayerTurn && automatic && premovesEnabled) {
+      const prepared = replyCache.take(fen, autoSettings());
+      if (prepared) {
+        if (showAdvantageBars) advantageBars.show(undefined);
+        showMove(prepared.move, 'Prepared recapture');
+        notify({ type: 'MOVE_UPDATE', move: prepared.move, meta: 'Prepared recapture' });
+        autoPlayer.suggest(fen, prepared.move, 0, { ...autoSettings(), preparedReply: true,
+          predictedOpponentMove: prepared.predictedOpponentMove });
+        return;
+      }
+    }
+    if (showAdvantageBars) advantageBars.show(null);
+    if (!isPlayerTurn) {
       clearHighlights();
-      setStatus(`Waiting for opponent (${playerColor === 'white' ? 'Black' : 'White'})…`);
+      publishStatus(`Waiting for opponent (${playerColor === 'white' ? 'Black' : 'White'})…`);
       const wrap = document.getElementById('cm-move-wrap');
       if (wrap) wrap.style.display = 'none';
-      return;
+      if (!showAdvantageBars && !(automatic && premovesEnabled)) return;
+    } else {
+      showThinking();
+      publishStatus('Analyzing…', 'waiting');
     }
-
-    showThinking();
+    const generation = ++analysisGeneration;
+    const analysisStarted = performance.now();
+    const settings = autoSettings();
 
     // Send position to background / offscreen Stockfish runner
-    chrome.runtime.sendMessage(
+    extensionOperation(() => new Promise((resolve, reject) => chrome.runtime.sendMessage(
       {
         type: 'ANALYZE_POSITION',
         fen,
         depth: analysisDepth,
-        humanizationLevel
+        timeBudgetMs,
+        humanizationLevel: isPlayerTurn ? humanizationLevel : 0,
+        qualityTarget: isPlayerTurn ? qualityTarget : null,
+        hints: { adaptiveDelay: automatic && adaptiveDelay, wantPrediction: !isPlayerTurn && automatic && premovesEnabled }
       },
       (response) => {
-        if (chrome.runtime.lastError || !response || !response.success) {
-          setStatus('Engine error');
-          console.error('[ChessMind]', chrome.runtime.lastError || response?.error);
+        try {
+          if (!extensionAvailable()) { reject(new Error(RELOAD_MESSAGE)); return; }
+          const error = chrome.runtime.lastError;
+          if (error) reject(new Error(error.message));
+          else resolve(response);
+        } catch (error) { reject(error); }
+      }
+    ))).then(response => {
+        if (!isEnabled || generation !== analysisGeneration || fen !== currentFen) return;
+        if (!response || !response.success) {
+          autoPlayer.stop('Engine error — stopped auto-play');
+          if (showAdvantageBars) advantageBars.show(undefined);
+          publishStatus('Engine error — try Refresh', '');
+          console.error('[ChessMind]', response?.error);
           return;
         }
 
+        if (showAdvantageBars) advantageBars.show(response.evaluation ?? undefined);
+        if (!isPlayerTurn) {
+          if (autoPlayer.state().active && premovesEnabled && response.prediction) {
+            replyCache.put(response.prediction, settings);
+            publishStatus('Prepared recapture ready; waiting for opponent');
+          }
+          return;
+        }
         showMove(response.move, response.meta);
+        publishStatus(response.move ? 'Suggestion ready' : 'No legal move', response.move ? 'active' : '');
 
         // Update popup if open
-        chrome.runtime.sendMessage({
+        notify({
           type: 'MOVE_UPDATE',
           move: response.move,
           meta: response.meta
-        }).catch(() => {});
-      }
-    );
+        });
+        autoPlayer.suggest(fen, response.move, Math.round(performance.now() - analysisStarted), { ...settings, moveQuality: response.moveQuality, difficulty: response.difficulty });
+    }).catch(error => {
+      if (contextError(error) || !isEnabled || generation !== analysisGeneration) return;
+      autoPlayer.stop('Engine error — stopped auto-play');
+      if (showAdvantageBars) advantageBars.show(undefined);
+      publishStatus('Engine error — try Refresh', '');
+      console.error('[ChessMind]', error);
+    });
   }
 
   // ─── Message listener (from popup) ─────────────────────────────────────────
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'SET_AUTOPLAY') {
+      toggleAutoPlay(Boolean(message.value))
+        .then(() => sendResponse({ ok: true, ...autoPlayer.state() }))
+        .catch(error => sendResponse({ ok: false, error: error.message }));
+      return true;
+    }
     if (message.type === 'REQUEST_FEN') {
       sendResponse({
         fen: buildFenFromDOM(),
@@ -792,66 +1134,138 @@
       const pColor = detectPlayerColor();
       const turn = fen ? fen.split(' ')[1] : null;
       const isMyTurn = turn === (pColor === 'white' ? 'w' : 'b');
-      const levelLabels = ['Pure engine', 'Subtle', 'Human-like', 'Casual'];
+      const levelLabels = ['Pure engine · uncapped', 'Subtle · ~1500 Elo', 'Human-like · ~1200 Elo', 'Casual · ~900 Elo', 'Expert · ~2300 Elo'];
       sendResponse({
         fen,
+        autoPlay: autoPlayer.state(),
+        autoPlayAllowed: ChessMindAutoPlay.isSupportedPage(location.href),
         playerColor: pColor,
         isMyTurn,
-        lastMove: isMyTurn ? lastComputedMove : null,
+        lastMove: isEnabled && isMyTurn && fen === currentFen ? lastComputedMove : null,
         meta: levelLabels[humanizationLevel],
-        status: isMyTurn ? 'Your turn' : `Waiting for opponent (${pColor === 'white' ? 'Black' : 'White'})…`
+        status: fen ? (isMyTurn ? 'Your turn' : `Waiting for opponent (${pColor === 'white' ? 'Black' : 'White'})…`) : positionIssue
       });
       return true;
     }
-    if (message.type === 'SET_ENABLED') {
-      isEnabled = message.value;
+    if (message.type === 'FORCE_ANALYZE') {
+      replyCache.clear();
+      invalidateAnalysis();
+      analyzePosition();
+      sendResponse({ ok: true });
+    }
+    if (message.type === 'SHOW_OVERLAY') {
+      if (overlayEl) overlayEl.style.display = '';
+      sendResponse({ ok: Boolean(overlayEl) });
+    }
+  });
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !overlayEl) return;
+    if (changes.enabled && changes.enabled.newValue !== isEnabled) {
+      isEnabled = Boolean(changes.enabled.newValue);
+      const toggle = document.getElementById('cm-enabled');
+      if (toggle) toggle.checked = isEnabled;
       if (isEnabled) startWatching();
       else stopWatching();
-      const cb = document.getElementById('cm-enabled');
-      if (cb) cb.checked = isEnabled;
     }
-    if (message.type === 'SET_HUMANIZE') {
-      humanizationLevel = message.value;
-      const sel = document.getElementById('cm-humanize');
-      if (sel) sel.value = humanizationLevel;
+    let analysisSettingsChanged = false;
+    if (['enabled', 'depth', 'timeBudgetMs', 'humanizationLevel', 'qualityTarget', 'manualPlayerColor',
+      'moveDelayMinMs', 'moveDelayMaxMs', 'adaptiveDelay', 'premovesEnabled'].some(key => changes[key])) replyCache.clear();
+    if (changes.adaptiveDelay) { adaptiveDelay = changes.adaptiveDelay.newValue !== false; analysisSettingsChanged = true; }
+    if (changes.premovesEnabled) { premovesEnabled = changes.premovesEnabled.newValue === true; analysisSettingsChanged = true; }
+    if (changes.qualityTarget) {
+      qualityTarget = changes.qualityTarget.newValue || { enabled: false, min: 75, max: 89 };
+      analysisSettingsChanged = true;
+      const select = document.getElementById('cm-humanize');
+      if (select) { select.disabled = Boolean(qualityTarget.enabled); select.title = qualityTarget.enabled ? 'Move-quality target is active; change it in the popup' : 'Engine level'; }
     }
-    if (message.type === 'SET_DEPTH') {
-      analysisDepth = message.value;
+    if (changes.humanizationLevel && changes.humanizationLevel.newValue !== humanizationLevel) {
+      humanizationLevel = changes.humanizationLevel.newValue;
+      const select = document.getElementById('cm-humanize');
+      if (select) select.value = humanizationLevel;
+      analysisSettingsChanged = true;
     }
-    if (message.type === 'SET_HIGHLIGHT') {
-      showBoardHighlights = message.value;
-      const cb = document.getElementById('cm-highlight');
-      if (cb) cb.checked = showBoardHighlights;
-      if (!showBoardHighlights) {
-        clearHighlights();
-      } else if (lastComputedMove) {
-        highlightMoveOnBoard(lastComputedMove);
-      }
+    if (changes.depth && changes.depth.newValue !== analysisDepth) {
+      analysisDepth = changes.depth.newValue;
+      analysisSettingsChanged = true;
     }
-    if (message.type === 'FORCE_ANALYZE') {
-      currentFen = null;
+    if (changes.timeBudgetMs && changes.timeBudgetMs.newValue !== timeBudgetMs) {
+      timeBudgetMs = changes.timeBudgetMs.newValue ?? 0;
+      analysisSettingsChanged = true;
+    }
+    if (changes.moveDelayMinMs) moveDelayMinMs = changes.moveDelayMinMs.newValue ?? 0;
+    if (changes.moveDelayMaxMs) moveDelayMaxMs = changes.moveDelayMaxMs.newValue ?? 0;
+    if (changes.analysisDelayMs) analysisDelayMs = changes.analysisDelayMs.newValue ?? 350;
+    if (analysisSettingsChanged) {
+      clearTimeout(analysisTimer);
+      invalidateAnalysis();
+      analyzePosition();
+    }
+    if (changes.showAdvantageBars) {
+      showAdvantageBars = changes.showAdvantageBars.newValue !== false;
+      if (!showAdvantageBars) advantageBars.hide();
+      invalidateAnalysis();
+      analyzePosition();
+    }
+    if (changes.showBoardHighlights && changes.showBoardHighlights.newValue !== showBoardHighlights) {
+      showBoardHighlights = Boolean(changes.showBoardHighlights.newValue);
+      const toggle = document.getElementById('cm-highlight');
+      if (toggle) toggle.checked = showBoardHighlights;
+      if (showBoardHighlights && lastComputedMove) highlightMoveOnBoard(lastComputedMove);
+      else clearHighlights();
+    }
+    if (changes.manualPlayerColor && changes.manualPlayerColor.newValue !== manualPlayerColor) {
+      manualPlayerColor = changes.manualPlayerColor.newValue;
+      updateOverlayPlayerColorBadge();
+      invalidateAnalysis();
       analyzePosition();
     }
   });
 
+  document.addEventListener('visibilitychange', () => {
+    if (!isEnabled) return;
+    invalidateAnalysis();
+    clearHighlights();
+    if (document.hidden) { autoPlayer.stop('Tab hidden'); publishStatus('Paused in background tab', ''); }
+    else analyzePosition();
+  });
+
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') autoPlayer.stop();
+  });
+  document.addEventListener('pointerdown', event => {
+    if (event.isTrusted && !overlayEl?.contains(event.target)) autoPlayer.stop('Manual page interaction');
+  }, true);
+  window.addEventListener('pagehide', () => autoPlayer.stop('Page closed'));
+
   // ─── Init ──────────────────────────────────────────────────────────────────
 
   function init() {
-    chrome.storage.local.get(['enabled', 'humanizationLevel', 'depth', 'showBoardHighlights', 'manualPlayerColor'], (data) => {
+    extensionOperation(() => chrome.storage.local.get(['enabled', 'humanizationLevel', 'depth', 'showBoardHighlights', 'manualPlayerColor', 'timeBudgetMs', 'analysisDelayMs', 'analysisPreset', 'moveDelayMinMs', 'moveDelayMaxMs', 'showAdvantageBars', 'qualityTarget', 'adaptiveDelay', 'premovesEnabled'])).then(data => {
+      if (contextRetired) return;
       isEnabled = data.enabled ?? false;
       humanizationLevel = data.humanizationLevel ?? 2;
       analysisDepth = data.depth ?? 15;
+      timeBudgetMs = data.timeBudgetMs ?? 0;
+      analysisDelayMs = data.analysisDelayMs ?? 350;
+      ({ moveDelayMinMs, moveDelayMaxMs } = ChessMindAutoPlay.delayRange(data.analysisPreset, data.moveDelayMinMs, data.moveDelayMaxMs));
       showBoardHighlights = data.showBoardHighlights ?? true;
+      showAdvantageBars = data.showAdvantageBars ?? true;
+      adaptiveDelay = data.adaptiveDelay !== false;
+      premovesEnabled = data.premovesEnabled === true;
+      qualityTarget = data.qualityTarget || { enabled: false, min: 75, max: 89 };
       manualPlayerColor = data.manualPlayerColor ?? 'auto';
 
       createOverlay();
       if (isEnabled) startWatching();
+    }).catch(error => {
+      if (!contextError(error)) console.error('[ChessMind] Initialization failed:', error);
     });
   }
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
-    setTimeout(init, 1000);
+    init();
   }
 })();
